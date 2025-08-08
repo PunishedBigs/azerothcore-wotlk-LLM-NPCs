@@ -5,6 +5,7 @@
 /conf/*
 !/conf/dist
 /modules/*
+!/modules/kobold-npc
 !/modules/*.md
 !/modules/*.sh
 !/modules/CMakeLists.txt
