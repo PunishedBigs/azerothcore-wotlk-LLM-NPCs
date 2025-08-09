@@ -25,7 +25,7 @@ struct AiConfig
     std::string host = "127.0.0.1";
     int port = 5001;
 
-    // Samplers (Restored to original defaults)
+    // Samplers
     int max_context_length = 8192;
     int max_length = 128;
     float temperature = 0.8f;
@@ -33,9 +33,14 @@ struct AiConfig
     float top_p = 0.9f;
     int top_k = 40;
 
+    // Format
+    std::string system_prompt = "You are a helpful AI assistant roleplaying as a character in the World of Warcraft.\nFollow these rules strictly:\n1. Always stay in character.\n2. Do not use newline characters in your response.\n3. Keep your responses to a single, concise paragraph.\n4. Never speak for the player.";
+    std::string system_tag = "{{{SYSTEM}}}";
+    std::string user_tag = "{{{INPUT}}}";
+    std::string assistant_tag = "{{{OUTPUT}}}";
+
     // Other
     std::string stop_sequence = "\\n||$||Player:||$||[INST]||$||</s>";
-    std::string system_prompt = "You are a helpful AI assistant roleplaying as a character in the World of Warcraft.\nFollow these rules strictly:\n1. Always stay in character.\n2. Do not use newline characters in your response.\n3. Keep your responses to a single, concise paragraph.\n4. Never speak for the player.";
     std::map<std::string, std::string> specific_character_cards;
 };
 
@@ -43,6 +48,9 @@ static AiConfig globalAiConfig;
 
 static std::map<ObjectGuid, std::string> conversationHistories;
 static ObjectGuid currentConversationTarget;
+
+// Buffer for receiving chunked save data
+static std::map<ObjectGuid, std::string> saveConfigBuffers;
 
 struct NpcResponse { ObjectGuid npcGuid; uint32 mapId; uint32 instanceId; std::string text; };
 struct StatusResponse { ObjectGuid playerGuid; bool isConnected; };
@@ -86,11 +94,24 @@ struct NpcChatReactionWorker
 //==============================================================================
 // Configuration Save/Load Functions
 //==============================================================================
+void ReplaceAll(std::string& str, const std::string& from, const std::string& to) {
+    if (from.empty())
+        return;
+    size_t start_pos = 0;
+    while ((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += to.length();
+    }
+}
+
 void SaveAIConfig()
 {
     std::ofstream configFile("AI_Mod_Config.conf");
     if (configFile.is_open())
     {
+        std::string promptToSave = globalAiConfig.system_prompt;
+        ReplaceAll(promptToSave, "\n", "||NL||");
+
         configFile << "host=" << globalAiConfig.host << std::endl;
         configFile << "port=" << globalAiConfig.port << std::endl;
         configFile << "max_context_length=" << globalAiConfig.max_context_length << std::endl;
@@ -99,6 +120,10 @@ void SaveAIConfig()
         configFile << "repetition_penalty=" << globalAiConfig.repetition_penalty << std::endl;
         configFile << "top_p=" << globalAiConfig.top_p << std::endl;
         configFile << "top_k=" << globalAiConfig.top_k << std::endl;
+        configFile << "system_prompt=" << promptToSave << std::endl;
+        configFile << "system_tag=" << globalAiConfig.system_tag << std::endl;
+        configFile << "user_tag=" << globalAiConfig.user_tag << std::endl;
+        configFile << "assistant_tag=" << globalAiConfig.assistant_tag << std::endl;
         configFile.close();
         LOG_INFO("server", "[AI MANAGER] Configuration saved.");
     }
@@ -129,6 +154,13 @@ void LoadAIConfig()
                 else if (key == "repetition_penalty") globalAiConfig.repetition_penalty = std::stof(value);
                 else if (key == "top_p") globalAiConfig.top_p = std::stof(value);
                 else if (key == "top_k") globalAiConfig.top_k = std::stoi(value);
+                else if (key == "system_prompt") {
+                    ReplaceAll(value, "||NL||", "\n");
+                    globalAiConfig.system_prompt = value;
+                }
+                else if (key == "system_tag") globalAiConfig.system_tag = value;
+                else if (key == "user_tag") globalAiConfig.user_tag = value;
+                else if (key == "assistant_tag") globalAiConfig.assistant_tag = value;
             }
         }
         configFile.close();
@@ -150,6 +182,10 @@ void SendFullAIConfig(Player* player)
     if (!player) return;
     std::ostringstream configStream;
     configStream << std::fixed << std::setprecision(2);
+
+    std::string promptToSend = globalAiConfig.system_prompt;
+    ReplaceAll(promptToSend, "\n", "||NL||");
+
     configStream << "host=" << globalAiConfig.host << ";"
         << "port=" << globalAiConfig.port << ";"
         << "max_context_length=" << globalAiConfig.max_context_length << ";"
@@ -157,7 +193,11 @@ void SendFullAIConfig(Player* player)
         << "temperature=" << globalAiConfig.temperature << ";"
         << "repetition_penalty=" << globalAiConfig.repetition_penalty << ";"
         << "top_p=" << globalAiConfig.top_p << ";"
-        << "top_k=" << globalAiConfig.top_k << ";";
+        << "top_k=" << globalAiConfig.top_k << ";"
+        << "system_prompt=" << promptToSend << ";"
+        << "system_tag=" << globalAiConfig.system_tag << ";"
+        << "user_tag=" << globalAiConfig.user_tag << ";"
+        << "assistant_tag=" << globalAiConfig.assistant_tag << ";";
 
     std::string fullMessage = "[AIMgr_CONFIG]" + configStream.str();
     ChatHandler(player->GetSession()).PSendSysMessage(fullMessage.c_str());
@@ -207,44 +247,66 @@ public:
 
     void OnPlayerBeforeSendChatMessage(Player* player, uint32& type, uint32& lang, std::string& msg) override
     {
-        if (msg.find("AIMGR") != std::string::npos && msg.find("GET_CONFIG") != std::string::npos)
+        if (msg.find("AIMGR") != std::string::npos)
         {
-            std::lock_guard<std::mutex> lock(configMutex);
-            configRequestQueue.push(player);
-            return;
-        }
-        else if (msg.find("AIMGR") != std::string::npos && msg.find("SAVE_CONFIG") != std::string::npos)
-        {
-            std::string data = msg.substr(msg.find("SAVE_CONFIG") + sizeof("SAVE_CONFIG"));
-
-            std::string::size_type start = 0;
-            while (start < data.length())
+            if (msg.find("GET_CONFIG") != std::string::npos)
             {
-                std::string::size_type end_key = data.find('=', start);
-                if (end_key == std::string::npos) break;
-                std::string key = data.substr(start, end_key - start);
-
-                std::string::size_type end_val = data.find(';', end_key);
-                if (end_val == std::string::npos) break;
-                std::string value = data.substr(end_key + 1, end_val - (end_key + 1));
-
-                if (key == "host") globalAiConfig.host = value;
-                else if (key == "port") globalAiConfig.port = std::stoi(value);
-                else if (key == "max_context_length") globalAiConfig.max_context_length = std::stoi(value);
-                else if (key == "max_length") globalAiConfig.max_length = std::stoi(value);
-                else if (key == "temperature") globalAiConfig.temperature = std::stof(value);
-                else if (key == "repetition_penalty") globalAiConfig.repetition_penalty = std::stof(value);
-                else if (key == "top_p") globalAiConfig.top_p = std::stof(value);
-                else if (key == "top_k") globalAiConfig.top_k = std::stoi(value);
-
-                start = end_val + 1;
+                std::lock_guard<std::mutex> lock(configMutex);
+                configRequestQueue.push(player);
+                return;
             }
+            else if (msg.find("SAVE_CONFIG_START") != std::string::npos)
+            {
+                saveConfigBuffers[player->GetGUID()] = ""; // Clear buffer
+                return;
+            }
+            else if (msg.find("SAVE_CONFIG_CHUNK") != std::string::npos)
+            {
+                std::string chunk = msg.substr(msg.find("SAVE_CONFIG_CHUNK") + sizeof("SAVE_CONFIG_CHUNK"));
+                saveConfigBuffers[player->GetGUID()] += chunk;
+                return;
+            }
+            else if (msg.find("SAVE_CONFIG_END") != std::string::npos)
+            {
+                std::string data = saveConfigBuffers[player->GetGUID()];
 
-            globalAiConfig.address = globalAiConfig.host + ":" + std::to_string(globalAiConfig.port);
-            SaveAIConfig();
-            SendFullAIConfig(player);
+                std::string::size_type start = 0;
+                while (start < data.length())
+                {
+                    std::string::size_type end_key = data.find('=', start);
+                    if (end_key == std::string::npos) break;
+                    std::string key = data.substr(start, end_key - start);
 
-            return;
+                    std::string::size_type end_val = data.find(';', end_key);
+                    if (end_val == std::string::npos) break;
+                    std::string value = data.substr(end_key + 1, end_val - (end_key + 1));
+
+                    if (key == "host") globalAiConfig.host = value;
+                    else if (key == "port") globalAiConfig.port = std::stoi(value);
+                    else if (key == "max_context_length") globalAiConfig.max_context_length = std::stoi(value);
+                    else if (key == "max_length") globalAiConfig.max_length = std::stoi(value);
+                    else if (key == "temperature") globalAiConfig.temperature = std::stof(value);
+                    else if (key == "repetition_penalty") globalAiConfig.repetition_penalty = std::stof(value);
+                    else if (key == "top_p") globalAiConfig.top_p = std::stof(value);
+                    else if (key == "top_k") globalAiConfig.top_k = std::stoi(value);
+                    else if (key == "system_prompt") {
+                        ReplaceAll(value, "||NL||", "\n");
+                        globalAiConfig.system_prompt = value;
+                    }
+                    else if (key == "system_tag") globalAiConfig.system_tag = value;
+                    else if (key == "user_tag") globalAiConfig.user_tag = value;
+                    else if (key == "assistant_tag") globalAiConfig.assistant_tag = value;
+
+                    start = end_val + 1;
+                }
+
+                globalAiConfig.address = globalAiConfig.host + ":" + std::to_string(globalAiConfig.port);
+                SaveAIConfig();
+                SendFullAIConfig(player);
+                saveConfigBuffers.erase(player->GetGUID()); // Clean up buffer
+
+                return;
+            }
         }
 
         if (type == CHAT_MSG_SAY)
